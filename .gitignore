@@ -1,0 +1,36 @@
+# ---- secrets & local config ----
+.env
+.env.*
+!.env.example
+
+# ---- data: never commit corpora, vector stores or model weights ----
+data/
+*.sqlite3
+*.bin
+chroma_db/
+uploaded_pdfs/
+
+# ---- the pre-refactor single-file version, kept locally only ----
+legacy/
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---- models & tooling caches ----
+.hf_cache/
+.qoder/
+
+# ---- editors / OS ----
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

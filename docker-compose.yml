@@ -1,0 +1,43 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      TIERED_RAG_REDIS_URL: redis://redis:6379/0
+      TIERED_RAG_CHROMA_DIR: /app/data/chroma_db
+      TIERED_RAG_UPLOAD_DIR: /app/data/pdfs
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - hf-cache:/models
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  ui:
+    image: python:3.12-slim
+    working_dir: /app
+    command: python ui/gradio_app.py
+    environment:
+      TIERED_RAG_BACKEND_URL: http://api:8000/chat/stream
+    volumes:
+      - .:/app
+    ports:
+      - "7860:7860"
+    depends_on:
+      - api
+    profiles: ["ui"]
+
+volumes:
+  hf-cache:
