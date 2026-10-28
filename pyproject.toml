@@ -49,3 +49,8 @@ src = ["src", "ui", "tests", "scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI declares parameter metadata by calling File()/Form()/Depends() in the
+# signature, which B008 would otherwise flag as an impure default value.
+extend-immutable-calls = ["fastapi.File", "fastapi.Form", "fastapi.Query", "fastapi.Depends"]

@@ -77,7 +77,7 @@ class Settings:
     chunk_separators: list[str] = field(default_factory=list)
 
     @classmethod
-    def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
+    def from_env(cls, env: dict[str, str] | None = None) -> Settings:
         if env is None:
             # Real environment wins over .env, so container-injected config is
             # never silently overridden by a stale file baked into an image.

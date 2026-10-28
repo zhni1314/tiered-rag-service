@@ -12,6 +12,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 warnings.filterwarnings("ignore")
 
 from contextlib import asynccontextmanager  # noqa: E402
+
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
 from starlette.concurrency import run_in_threadpool  # noqa: E402
@@ -73,7 +74,7 @@ async def lifespan(application: FastAPI):
     stored = vectorstore.get()
     docs = [
         Document(page_content=text, metadata=meta)
-        for text, meta in zip(stored.get("documents", []), stored.get("metadatas", []))
+        for text, meta in zip(stored.get("documents", []), stored.get("metadatas", []), strict=True)
     ]
     if not docs:
         docs = [Document(page_content="欢迎使用 RAG 智能问答系统。", metadata={"level": "public"})]
