@@ -1,0 +1,30 @@
+%% Current implementation view; default settings; cache figure is a small-sample measurement.
+%% Evidence: src/tiered_rag/service.py:41-101,157-195; chain.py:36-74; retrieval.py:21-40; history.py:16-37.
+%% architecture-communicator; Mermaid source with derived PNG for publication.
+flowchart TB
+    API["FastAPI 问答入口<br/>question + user_level + session_id"]
+    HISTORY[("Redis 会话历史<br/>按 session_id 读写")]
+    REWRITE["条件查询重写<br/>有历史且命中指代词才调用 LLM"]
+    TIER["选择档位检索引擎<br/>public / secret；客户端声明，非鉴权"]
+    BM25["BM25 + jieba<br/>限定档位语料；默认 top-20"]
+    DENSE["Chroma 向量检索<br/>metadata 档位过滤；默认 top-20"]
+    FUSION["Ensemble 排名融合<br/>默认权重 0.5 / 0.5"]
+    RERANK["Cross-encoder 重排<br/>默认保留 top-3"]
+    PROMPT["组装回答 Prompt<br/>检索片段 + 原始问题 + 历史"]
+    LLM["LangChain 模型调用 → Qwen<br/>生成回答；非流式 / 流式路径不同"]
+    CACHE[("Redis LLM cache<br/>已接入；实测命中提速 27%（n=9）")]
+    OUTPUT["返回回答并追加历史<br/>/chat 或 /chat/stream"]
+    API -->|传入问题与档位| REWRITE
+    HISTORY -->|读取历史| REWRITE
+    REWRITE -->|独立查询或原问题| TIER
+    TIER -->|词法召回| BM25
+    TIER -->|语义召回| DENSE
+    BM25 -->|候选排名| FUSION
+    DENSE -->|候选排名| FUSION
+    FUSION -->|融合候选| RERANK
+    RERANK -->|检索上下文| PROMPT
+    PROMPT -->|模型输入| LLM
+    LLM -.->|非流式缓存读写| CACHE
+    REWRITE -.->|重写调用也适用| CACHE
+    LLM -->|生成文本| OUTPUT
+    OUTPUT -->|写入本轮对话| HISTORY

@@ -5,6 +5,7 @@
 
 # ---- data: never commit corpora, vector stores or model weights ----
 data/
+dump.rdb
 *.sqlite3
 *.bin
 chroma_db/
