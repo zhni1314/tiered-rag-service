@@ -143,6 +143,7 @@ src/tiered_rag/
 └── service.py      # FastAPI 装配与路由
 ui/gradio_app.py    # 演示前端，只依赖 HTTP
 scripts/build_index.py
+scripts/evaluate.py   # 缓存收益 + RAGAS 实测，跑在自编语料上，密钥运行时输入
 tests/              # 纯逻辑单测，不需要模型/Redis/密钥
 ```
 
@@ -168,8 +169,10 @@ chunk 尺寸与 metadata 打标、**上传路径穿越拒绝**。
    现在的实现只证明了「检索层能做数据隔离」，没证明「系统能抵抗越权」。
    最小修复：签发带角色的 Token，服务端解析角色，请求体里的 `user_level` 只作为*请求*，
    以 Token 为准（deny-by-default）。
-2. **没有检索质量评测。** 权重 0.5/0.5、`top-3`、`chunk_size=800` 全是经验值，未做消融。
-   目前只有 55 个 chunk，样本量不足以支撑任何结论。见 [docs/evaluation.md](docs/evaluation.md)。
+2. **评测只有小样本流程验证，尚无生产级指标。** `scripts/evaluate.py` 已能实测缓存收益与 RAGAS
+   四项指标，但跑在 24 段自编语料、3 道题上：上下文指标已饱和，忠实度的组间差异被评委抖动盖过，
+   BM25 与不重排两组消融还没跑。权重 0.5/0.5、`top-3`、`chunk_size=800` 仍是经验值，
+   `recall@k` / `MRR` 仍未测量。见 [docs/evaluation.md](docs/evaluation.md)。
 3. **每次上传全量重建 BM25**，`O(N)` 且随库增长变慢；小库无所谓，千级 chunk 就需要持久化 BM25。
 4. **扫描版 PDF 无输出。** `pypdf` 提不到文字就返回空，需要 OCR。
 5. **用了已弃用 API。** `langchain_community.vectorstores.Chroma` 官方建议迁移 `langchain-chroma`。
@@ -182,7 +185,7 @@ chunk 尺寸与 metadata 打标、**上传路径穿越拒绝**。
 按「对面试说服力」排序，不是按工作量：
 
 - [ ] 真实鉴权：角色化 Token + deny-by-default（补限制 1）
-- [ ] 评测集 + `recall@k` / `MRR` / 答案忠实度，含权重消融表（补限制 2）
+- [ ] 评测集扩到 30+ 题（含干扰文档），补 BM25 与不重排两组消融，测 `recall@k` / `MRR`（补限制 2）
 - [ ] 引用溯源：答案回链到 chunk 与页码
 - [ ] 迁移 `langchain-chroma`，去掉弃用告警
 - [ ] BM25 索引持久化，避免全量重建
