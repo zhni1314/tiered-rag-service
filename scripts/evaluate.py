@@ -1,9 +1,14 @@
-"""Run isolated, non-streaming cache and RAGAS experiments on a synthetic corpus."""
+"""Run isolated, non-streaming cache, retrieval-recall and RAGAS experiments.
+
+Everything runs on a synthetic corpus; paid API calls are budgeted, keys are
+typed at runtime and telemetry stays off.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import getpass
 import hashlib
 import importlib.metadata
@@ -26,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATASET = Path(__file__).with_name("eval_dataset.json")
 VARIANTS = ("dense", "bm25", "hybrid", "hybrid_rerank")
 METRICS = ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
+RECALL_KS = (1, 3, 5, 8)
 
 
 def configure_environment(hf_home: Path) -> None:
@@ -221,9 +227,22 @@ def check_cache_expectation(row: dict, group: str, seed: dict) -> None:
         row.update(ok=False, error={"type": "CacheExpectationMismatch"})
 
 
+def eval_settings(settings):
+    """Keep the evaluated prompt identical to the recorded contexts.
+
+    Production caps top-3 parents inside 3200 chars. If the judge scored the full
+    top-k while the LLM saw a truncated subset, the quality numbers would describe
+    a prompt that was never actually sent.
+    """
+    return dataclasses.replace(
+        settings, max_parents=settings.rerank_top_n, context_budget_chars=10**7
+    )
+
+
 async def run_cache(questions, args, settings, engine, llm, cache, meter, emit):
     from tiered_rag.chain import build_chain
 
+    settings = eval_settings(settings)
     recorder = RecordingPool(engine, settings.rerank_top_n)
     chains = {
         "disabled": build_chain(llm.model_copy(update={"cache": False}), recorder, settings),
@@ -263,6 +282,7 @@ async def run_cache(questions, args, settings, engine, llm, cache, meter, emit):
 async def run_quality(questions, args, settings, engines, llm, metrics, meter, emit):
     from tiered_rag.chain import build_chain
 
+    settings = eval_settings(settings)
     for question in questions:
         for variant in args.variants:
             recorder = RecordingPool(engines[variant], settings.rerank_top_n)
@@ -304,8 +324,48 @@ async def run_quality(questions, args, settings, engines, llm, metrics, meter, e
                 return
 
 
+def rank_metrics(ranked_ids: list[str], gold_ids: list[str]) -> dict:
+    gold = set(gold_ids)
+    result = {"mrr": 0.0}
+    for rank, doc_id in enumerate(ranked_ids, start=1):
+        if doc_id in gold:
+            result["mrr"] = round(1.0 / rank, 4)
+            break
+    for k in RECALL_KS:
+        found = gold & set(ranked_ids[:k])
+        result[f"recall@{k}"] = round(len(found) / len(gold), 4)
+        result[f"full@{k}"] = len(found) == len(gold)
+    return result
+
+
+def run_recall(questions, args, engines, emit):
+    for question in questions:
+        for variant in args.variants:
+            started = time.perf_counter()
+            row = {
+                "kind": "recall",
+                "variant": variant,
+                "question_id": question["id"],
+                "category": question["category"],
+                "user_input": question["question"],
+                "gold_ids": list(question["gold_ids"]),
+                "ok": False,
+            }
+            try:
+                docs = engines[variant].invoke(question["question"])
+            except Exception as exc:
+                row["error"] = error_info(exc)
+                emit(row)
+                return
+            row["ranked_ids"] = [str(doc.metadata.get("eval_id", "")) for doc in docs]
+            row["retrieval_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            row.update(rank_metrics(row["ranked_ids"], row["gold_ids"]))
+            row["ok"] = True
+            emit(row)
+
+
 def summarize(rows: list[dict]) -> dict:
-    summary = {"cache": {}, "ragas": {}}
+    summary = {"cache": {}, "ragas": {}, "recall": {}}
     for group in ("disabled", "miss", "hit"):
         attempts = [r for r in rows if r["kind"] == "cache" and r["group"] == group]
         good = [r for r in attempts if r["ok"]]
@@ -338,6 +398,34 @@ def summarize(rows: list[dict]) -> dict:
                 "failed_or_skipped": len(attempts) - len(valid),
             }
         summary["ragas"][variant] = result
+    for variant in VARIANTS:
+        attempts = [r for r in rows if r["kind"] == "recall" and r["variant"] == variant]
+        if not attempts:
+            continue
+        good = [r for r in attempts if r["ok"]]
+        result = {
+            "attempted": len(attempts),
+            "failed": len(attempts) - len(good),
+            "retrieval_p50_ms": percentile([r["retrieval_ms"] for r in good], 0.5),
+        }
+        groups = {"all": good}
+        for category in sorted({r["category"] for r in good}):
+            groups[category] = [r for r in good if r["category"] == category]
+        for label, subset in groups.items():
+            if not subset:
+                continue
+            result[label] = {
+                "n": len(subset),
+                "mrr": round(statistics.mean(r["mrr"] for r in subset), 4),
+            }
+            for k in RECALL_KS:
+                result[label][f"recall@{k}"] = round(
+                    statistics.mean(r[f"recall@{k}"] for r in subset), 4
+                )
+                result[label][f"full@{k}"] = round(
+                    sum(r[f"full@{k}"] for r in subset) / len(subset), 4
+                )
+        summary["recall"][variant] = result
     return summary
 
 
@@ -388,14 +476,14 @@ def preflight(args):
     return versions, paths, redis_client
 
 
-def build_engines(settings, model_paths, dataset, run_dir, device):
+def build_engines(settings, model_paths, dataset, run_dir, device, chunking="flat"):
     import chromadb
     from chromadb.config import Settings as ChromaSettings
     from langchain_community.cross_encoders import HuggingFaceCrossEncoder
     from langchain_community.vectorstores import Chroma
     from langchain_huggingface import HuggingFaceEmbeddings
 
-    from tiered_rag.indexer import chunk_to_documents
+    from tiered_rag.indexer import chunk_parent_child, chunk_to_documents
     from tiered_rag.retrieval import RetrieverPool
 
     embeddings = HuggingFaceEmbeddings(
@@ -413,7 +501,12 @@ def build_engines(settings, model_paths, dataset, run_dir, device):
     store = Chroma(client=client, collection_name="synthetic_eval", embedding_function=embeddings)
     documents = []
     for item in dataset["documents"]:
-        chunks = chunk_to_documents(item["text"], "public", settings)
+        if chunking == "parent_child":
+            chunks = chunk_parent_child(
+                item["text"], "public", f"{item['id']}.md", settings
+            ).children
+        else:
+            chunks = chunk_to_documents(item["text"], "public", settings)
         for doc in chunks:
             doc.metadata.update(source="synthetic-handbook", eval_id=item["id"])
         documents.extend(chunks)
@@ -453,8 +546,12 @@ async def execute(args, key, settings, model_paths, dataset, redis_client, run_d
 
         try:
             print("正在加载本地模型并构建独立测试索引；启动和预热不计入请求耗时。")
-            engines, chunks = build_engines(settings, model_paths, dataset, run_dir, args.device)
+            engines, chunks = build_engines(
+                settings, model_paths, dataset, run_dir, args.device, args.chunking
+            )
             metadata["chunks"] = chunks
+            if args.mode == "recall":
+                run_recall(questions, args, engines, emit)
             async with httpx.AsyncClient(
                 timeout=args.timeout,
                 event_hooks={"request": [meter.on_request], "response": [meter.on_response]},
@@ -542,13 +639,16 @@ async def execute(args, key, settings, model_paths, dataset, redis_client, run_d
             expected_quality = (
                 len(questions) * len(args.variants) if args.mode in ("ragas", "all") else 0
             )
+            expected_recall = len(questions) * len(args.variants) if args.mode == "recall" else 0
             cache_rows = [r for r in rows if r["kind"] == "cache"]
             quality_rows = [r for r in rows if r["kind"] == "quality"]
+            recall_rows = [r for r in rows if r["kind"] == "recall"]
             complete = (
                 fatal_error is None
                 and "cache_cleanup_error" not in metadata
                 and len(cache_rows) == expected_cache
                 and len(quality_rows) == expected_quality
+                and len(recall_rows) == expected_recall
                 and all(r["ok"] for r in rows)
                 and all(not r.get("metric_errors") for r in quality_rows)
             )
@@ -560,6 +660,7 @@ async def execute(args, key, settings, model_paths, dataset, redis_client, run_d
                     "api_usage": vars(meter),
                     "expected_cache_rows": expected_cache,
                     "expected_quality_rows": expected_quality,
+                    "expected_recall_rows": expected_recall,
                 }
             )
             (run_dir / "summary.json").write_text(
@@ -574,13 +675,21 @@ async def execute(args, key, settings, model_paths, dataset, redis_client, run_d
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("check", "cache", "ragas", "all"), default="check")
     parser.add_argument(
-        "--questions", type=int, default=3, help="First N synthetic questions (1-12)"
+        "--mode", choices=("check", "cache", "ragas", "recall", "all"), default="check"
+    )
+    parser.add_argument(
+        "--questions", type=int, default=3, help="First N synthetic questions (1-22)"
     )
     parser.add_argument("--repeats", type=int, default=3, help="Cache trials per question (1-20)")
     parser.add_argument(
         "--variants", nargs="+", choices=VARIANTS, default=["dense", "hybrid_rerank"]
+    )
+    parser.add_argument(
+        "--chunking",
+        choices=("flat", "parent_child"),
+        default="flat",
+        help="index chunking: flat 800-char chunks, or parent 800 / child 200",
     )
     parser.add_argument("--hf-home", type=Path, default=ROOT / ".hf_cache")
     parser.add_argument("--embedding-model", default="BAAI/bge-small-zh-v1.5")
@@ -595,8 +704,8 @@ def parse_args():
     parser.add_argument("--max-api-requests", type=int, default=120)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    if not 1 <= args.questions <= 12 or not 1 <= args.repeats <= 20:
-        parser.error("questions must be 1-12; repeats must be 1-20")
+    if not 1 <= args.questions <= 22 or not 1 <= args.repeats <= 20:
+        parser.error("questions must be 1-22; repeats must be 1-20")
     if args.max_api_requests < 1 or args.timeout <= 0:
         parser.error("timeout and max-api-requests must be positive")
     endpoint = urlsplit(args.base_url)
@@ -630,21 +739,6 @@ def main() -> int:
         if args.mode == "check":
             print(json.dumps(versions, ensure_ascii=False, indent=2))
             return 0
-        print(f"将把自编手册片段发送给 {urlsplit(args.base_url).hostname}，会产生模型调用费用。")
-        print(
-            f"问题数：{args.questions}；模型请求尝试上限：{args.max_api_requests}（非金额上限）。"
-        )
-        if not sys.stdin.isatty():
-            print("请在自己的交互式终端运行，以安全输入密钥。")
-            return 1
-        if input("确认执行请输入 RUN，其余输入退出：").strip() != "RUN":
-            return 0
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", getpass.GetPassWarning)
-            key = getpass.getpass("输入 API Key（不显示、不写入文件）：").strip()
-        if not key:
-            print("未输入密钥，已退出。")
-            return 1
         settings = Settings.from_env(
             {
                 "TIERED_RAG_EMBEDDING_MODEL": args.embedding_model,
@@ -652,11 +746,37 @@ def main() -> int:
                 "TIERED_RAG_LEVELS": "public",
             }
         )
+        if args.mode == "recall":
+            # One wide ranking, then truncated per k: rebuilding per k would rerun the
+            # cross-encoder for every k and cost minutes for no extra information.
+            settings = dataclasses.replace(settings, rerank_top_n=settings.retrieve_k)
+            key = "offline-no-call"
+            print("离线检索评测：只用本地向量与重排模型，不发送内容到 API，不产生费用。")
+        else:
+            print(
+                f"将把自编手册片段发送给 {urlsplit(args.base_url).hostname}，"
+                "会产生模型调用费用。"
+            )
+            print(
+                f"问题数：{args.questions}；模型请求尝试上限：{args.max_api_requests}（非金额上限）。"
+            )
+            if not sys.stdin.isatty():
+                print("请在自己的交互式终端运行，以安全输入密钥。")
+                return 1
+            if input("确认执行请输入 RUN，其余输入退出：").strip() != "RUN":
+                return 0
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                key = getpass.getpass("输入 API Key（不显示、不写入文件）：").strip()
+            if not key:
+                print("未输入密钥，已退出。")
+                return 1
         run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
         run_dir = ROOT / "data" / "evaluation" / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
         metadata = {
             "run_id": run_id,
+            "mode": args.mode,
             "dataset": dataset["name"],
             "dataset_sha256": dataset_hash,
             "versions": versions,
@@ -679,6 +799,8 @@ def main() -> int:
             "judge_max_tokens": 2048,
             "chunk_size": settings.chunk_size,
             "chunk_overlap": settings.chunk_overlap,
+            "child_chunk_size": settings.child_chunk_size,
+            "chunking": args.chunking,
             "retrieve_k": settings.retrieve_k,
             "rerank_top_n": settings.rerank_top_n,
             "bm25_weight": settings.bm25_weight,
@@ -693,6 +815,13 @@ def main() -> int:
                 "API request count includes warmup, prefills and judge retries; not billing proof",
             ],
         }
+        if args.mode == "recall":
+            metadata["recall_ks"] = list(RECALL_KS)
+            metadata["limitations"].append(
+                "recall mode: rerank_top_n here is the candidate width; each recall@k is "
+                "truncated from that single ranking and equals an online top_n=k run; "
+                "no generation or judge calls, so answer quality is not measured"
+            )
         return asyncio.run(
             execute(
                 args,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,12 +33,65 @@ def test_percentile(values, fraction, expected):
 def test_dataset_references_only_its_synthetic_documents():
     dataset, digest = evaluate.load_dataset()
     ids = {item["id"] for item in dataset["documents"]}
-    assert len(dataset["questions"]) == 12
+    assert dataset["name"] == "synthetic-team-handbook-v2"
+    assert len(dataset["questions"]) == 22
     assert len(ids) == 24
     assert len(digest) == 64
     for item in dataset["questions"]:
         assert set(item["gold_ids"]) <= ids
         assert item["reference"]
+    assert len({item["id"] for item in dataset["questions"]}) == 22
+    counts = Counter(item["category"] for item in dataset["questions"])
+    assert dict(counts) == {"exact": 6, "paraphrase": 4, "cross_document": 12}
+    # 单份语料就能答全的题会退化成单跳题，跨文档题必须真的依赖两份以上语料
+    for item in dataset["questions"]:
+        if item["category"] == "cross_document":
+            assert len(set(item["gold_ids"])) >= 2
+
+
+def test_rank_metrics_truncate_one_ranking():
+    first = evaluate.rank_metrics(["a", "x", "b", "y", "z"], ["a", "b"])
+    assert first["recall@1"] == 0.5
+    assert first["full@1"] is False
+    assert first["recall@3"] == 1.0
+    assert first["full@3"] is True
+    assert first["mrr"] == 1.0
+    second = evaluate.rank_metrics(["x", "a"], ["a", "b"])
+    assert second["recall@3"] == 0.5
+    assert second["full@8"] is False
+    assert second["mrr"] == 0.5
+
+
+def test_recall_summary_separates_cross_document_from_single_hop():
+    def row(category, ranked, gold, ok=True):
+        item = {
+            "kind": "recall",
+            "variant": "hybrid_rerank",
+            "question_id": f"{category}-1",
+            "category": category,
+            "gold_ids": gold,
+            "ranked_ids": ranked,
+            "retrieval_ms": 20.0 if ok else 0.0,
+            "ok": ok,
+        }
+        if ok:
+            item.update(evaluate.rank_metrics(ranked, gold))
+        return item
+
+    summary = evaluate.summarize(
+        [
+            row("exact", ["leave", "guest"], ["leave"]),
+            row("cross_document", ["review", "release"], ["review", "release"], ok=False),
+            row("cross_document", ["release", "guest"], ["review", "release"]),
+        ]
+    )["recall"]["hybrid_rerank"]
+    assert summary["attempted"] == 3
+    assert summary["failed"] == 1
+    assert summary["all"]["n"] == 2
+    assert summary["exact"]["recall@3"] == 1.0
+    assert summary["cross_document"]["n"] == 1
+    assert summary["cross_document"]["recall@3"] == 0.5
+    assert summary["cross_document"]["full@3"] == 0.0
 
 
 def test_error_output_does_not_include_message_or_credentials():
