@@ -14,6 +14,10 @@ uploaded_pdfs/
 # ---- the pre-refactor single-file version, kept locally only ----
 legacy/
 
+# ---- personal: resume carries name/phone/email, repo is public ----
+resume.md
+resume*.docx
+
 # ---- python ----
 __pycache__/
 *.py[cod]

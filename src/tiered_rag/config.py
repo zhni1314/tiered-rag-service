@@ -67,6 +67,11 @@ class Settings:
 
     chunk_size: int
     chunk_overlap: int
+    child_chunk_size: int
+    child_chunk_overlap: int
+    max_parents: int
+    context_budget_chars: int
+    parent_store: Path
 
     header_pattern: str
     footer_pattern: str
@@ -91,6 +96,7 @@ class Settings:
 
         hf_home = _get(env, "HF_HOME")
         bm25_weight = _float(env, "TIERED_RAG_BM25_WEIGHT", 0.5)
+        chroma_dir = _path(env, "TIERED_RAG_CHROMA_DIR", "data/chroma_db")
 
         return cls(
             qwen_api_key=_get(env, "QWEN_API_KEY"),
@@ -102,16 +108,25 @@ class Settings:
             reranker_model=_get(env, "TIERED_RAG_RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
             hf_home=Path(hf_home).expanduser() if hf_home else None,
             hf_endpoint=_get(env, "HF_ENDPOINT", "https://huggingface.co"),
-            chroma_dir=_path(env, "TIERED_RAG_CHROMA_DIR", "data/chroma_db"),
-            chroma_collection=_get(env, "TIERED_RAG_CHROMA_COLLECTION", "rag_collection_v2"),
+            chroma_dir=chroma_dir,
+            chroma_collection=_get(env, "TIERED_RAG_CHROMA_COLLECTION", "rag_collection_v3"),
             upload_dir=_path(env, "TIERED_RAG_UPLOAD_DIR", "data/pdfs"),
             redis_url=_get(env, "TIERED_RAG_REDIS_URL", "redis://localhost:6379/0"),
             bm25_weight=bm25_weight,
             vector_weight=_float(env, "TIERED_RAG_VECTOR_WEIGHT", 1.0 - bm25_weight),
             retrieve_k=_int(env, "TIERED_RAG_RETRIEVE_K", 20),
-            rerank_top_n=_int(env, "TIERED_RAG_RERANK_TOP_N", 3),
+            rerank_top_n=_int(env, "TIERED_RAG_RERANK_TOP_N", 10),
             chunk_size=_int(env, "TIERED_RAG_CHUNK_SIZE", 800),
             chunk_overlap=_int(env, "TIERED_RAG_CHUNK_OVERLAP", 20),
+            child_chunk_size=_int(env, "TIERED_RAG_CHILD_CHUNK_SIZE", 200),
+            child_chunk_overlap=_int(env, "TIERED_RAG_CHILD_CHUNK_OVERLAP", 20),
+            max_parents=_int(env, "TIERED_RAG_MAX_PARENTS", 3),
+            context_budget_chars=_int(env, "TIERED_RAG_CONTEXT_BUDGET", 3200),
+            parent_store=_path(
+                env,
+                "TIERED_RAG_PARENT_STORE",
+                str(chroma_dir / "parent_store.json"),
+            ),
             chunk_separators=[
                 s for s in _get(env, "TIERED_RAG_CHUNK_SEPARATORS", "\n\n,。,！,？").split(",")
             ],

@@ -8,9 +8,10 @@ FastAPI app
      ├── settings      Settings          # 启动时读取，之后不可变
      ├── redis         Redis             # 会话历史 + LangChain LLM cache
      ├── history       HistoryStore
-     ├── vectorstore   Chroma            # 持久化在 settings.chroma_dir
+     ├── vectorstore   Chroma            # 只存子块；持久化在 settings.chroma_dir
+     ├── parents       ParentStore       # parent_id → 父块正文，JSON，原子替换
      ├── pool          RetrieverPool     # {level -> ContextualCompressionRetriever}
-     └── chain         Runnable          # 条件重写 → 检索 → 生成
+     └── chain         Runnable          # 条件重写 → 检索 → 拼上下文 → 生成
 ```
 
 启动顺序在 `service.lifespan` 里，**顺序有硬约束**：
@@ -29,9 +30,11 @@ FastAPI app
 |---|---|---|---|
 | `config` | env dict / 进程环境 | frozen `Settings` | 仅标准库 + dotenv |
 | `text_cleaning` | 原始文本 + 正则 | 清洗后文本 | 仅 `re` |
-| `indexer` | PDF 路径、档位 | `list[Document]` | pypdf、text-splitters |
+| `indexer` | PDF 路径、档位 | `Ingested{子块, 父块字典}` | pypdf、text-splitters |
+| `parents` | JSON 路径 | `id → 父块正文`，可持久化 | 仅标准库 |
+| `context` | 重排后的子块 + 父块字典 | Prompt 上下文文本 | langchain-core |
 | `retrieval` | `Document` 全集 | 按档编译的检索引擎 | langchain-community/classic |
-| `chain` | LLM + pool + settings | `Runnable` | langchain-core |
+| `chain` | LLM + pool + settings + parents | `Runnable` | langchain-core |
 | `history` | Redis client | 提示文本 / 历史列表 | redis |
 | `service` | 以上全部 | HTTP 行为 | fastapi |
 
@@ -41,8 +44,9 @@ FastAPI app
 ## RetrieverPool 的并发模型
 
 `rebuild()` 在锁外构建完整引擎字典，成功后一次性替换引用；`get()` 只读字典。
-上传路径经 `run_in_threadpool` 调 `pool.add()`，其间可能有 `/chat` 正在 `get()`：
-读者要么拿到旧快照，要么拿到新快照，不会读到构建中的半成品。
+上传路径经 `run_in_threadpool` 调 `pool.replace_source()`，其间可能有 `/chat` 正在 `get()`：
+读者要么拿到旧快照，要么拿到新快照，不会读到构建中的半成品。`replace_source` 先按
+`source` 丢掉旧子块再重建 BM25，否则重传同名文件会让同一段文本在候选集里出现两份。
 
 代价是上传期间到达的请求仍用旧索引 —— 这是可接受的最终一致性，比加读写锁复杂度划算。
 
@@ -57,8 +61,9 @@ FastAPI app
        2.3.1 BM25 top-20（该档专属语料）
        2.3.2 Chroma top-20 + metadata filter {level: {$in: allowed}}
        2.3.3 EnsembleRetriever 融合去重
-       2.3.4 CrossEncoder 打分 → top-3
-   2.4 Grounding Prompt 填充 → LLM → StrOutputParser
+       2.3.4 CrossEncoder 打分 → top-10 子块
+   2.4 context.assemble_context：按名次去重父块 → 3 块 / 3200 字预算
+   2.5 Grounding Prompt 填充 → LLM → StrOutputParser
 3. HistoryStore.append_turn(...)                # RPUSH + LTRIM 保持有界
 4. ChatResponse{answer, latency, level}
 ```

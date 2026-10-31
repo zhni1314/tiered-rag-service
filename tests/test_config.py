@@ -10,8 +10,23 @@ def test_defaults_match_the_tuned_pipeline():
     s = _settings()
     assert s.levels == ("public", "secret")
     assert s.chunk_size == 800
-    assert s.rerank_top_n == 3
+    assert s.child_chunk_size == 200
+    assert s.max_parents == 3
+    assert s.context_budget_chars == 3200
+    # More children than parents: several children can share one parent.
+    assert s.rerank_top_n == 10
     assert s.embedding_model == "BAAI/bge-small-zh-v1.5"
+
+
+def test_parent_store_defaults_inside_the_chroma_dir():
+    s = _settings()
+    assert s.parent_store == s.chroma_dir / "parent_store.json"
+
+
+def test_parent_store_can_be_pointed_elsewhere():
+    s = _settings(TIERED_RAG_PARENT_STORE="data/custom/parents.json")
+    assert s.parent_store.is_absolute()
+    assert s.parent_store.parts[-2:] == ("custom", "parents.json")
 
 
 def test_vector_weight_defaults_to_the_remainder_of_bm25():

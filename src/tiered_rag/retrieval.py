@@ -14,6 +14,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 
 from .config import Settings
+from .indexer import without_source
 
 _EMPTY = Document(page_content="暂无数据", metadata={"level": "public"})
 
@@ -85,6 +86,12 @@ class RetrieverPool:
         with self._lock:
             combined = self._docs + docs
         self.rebuild(combined)
+
+    def replace_source(self, source: str, docs: list[Document]) -> None:
+        """Swap in a re-uploaded file without leaving its old chunks in BM25."""
+        with self._lock:
+            kept = without_source(self._docs, source)
+        self.rebuild(kept + docs)
 
     def get(self, level: str):
         with self._lock:

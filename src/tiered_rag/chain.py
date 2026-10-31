@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 
 from .config import Settings
+from .context import assemble_context
 from .retrieval import RetrieverPool
 
 log = logging.getLogger(__name__)
@@ -33,7 +35,13 @@ _REWRITE_SYSTEM = (
 )
 
 
-def build_chain(llm, pool: RetrieverPool, settings: Settings):
+def build_chain(
+    llm,
+    pool: RetrieverPool,
+    settings: Settings,
+    parents: Mapping[str, str] | None = None,
+):
+    parent_texts = parents if parents is not None else {}
     answer_prompt = ChatPromptTemplate.from_messages(
         [
             ("system", _ANSWER_SYSTEM),
@@ -59,7 +67,15 @@ def build_chain(llm, pool: RetrieverPool, settings: Settings):
         engine = pool.get(x["user_level"])
         # The cross-encoder rerank is CPU-bound; keep it off the event loop.
         docs = await asyncio.to_thread(engine.invoke, x["rewritten_query"])
-        return "\n".join(doc.page_content for doc in docs)
+        context = assemble_context(
+            docs,
+            parent_texts,
+            max_parents=settings.max_parents,
+            budget=settings.context_budget_chars,
+        )
+        if not context:
+            log.warning("empty context: query=%r docs=%d", x["rewritten_query"], len(docs))
+        return context
 
     return (
         RunnablePassthrough.assign(rewritten_query=RunnableLambda(smart_rewrite))

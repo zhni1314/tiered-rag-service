@@ -1,9 +1,15 @@
 from pathlib import Path
 
 import pytest
+from langchain_core.documents import Document
 
 from tiered_rag.config import Settings
-from tiered_rag.indexer import chunk_to_documents, safe_filename
+from tiered_rag.indexer import (
+    chunk_parent_child,
+    chunk_to_documents,
+    safe_filename,
+    without_source,
+)
 
 
 @pytest.fixture
@@ -64,3 +70,56 @@ def test_every_chunk_carries_its_permission_level():
 def test_chunk_size_is_respected():
     docs = chunk_to_documents("很长的一段中文。" * 500, "public", _settings())
     assert all(len(d.page_content) <= 800 for d in docs)
+
+
+def _ingest_sample(source: str = "实验册.pdf"):
+    return chunk_parent_child("句子内容。" * 200, "public", source, _settings())
+
+
+def test_children_are_small_and_point_at_a_stored_parent():
+    result = _ingest_sample()
+
+    assert len(result.parents) > 1
+    for child in result.children:
+        meta = child.metadata
+        assert len(child.page_content) <= 200
+        assert meta["parent_id"] in result.parents
+        assert meta["source"] == "实验册.pdf"
+        assert meta["level"] == "public"
+        assert isinstance(meta["parent_index"], int)
+        # The parent body must live in the store, not be copied into metadata.
+        assert "parent_text" not in meta
+
+
+def test_every_parent_is_reachable_from_its_children():
+    result = _ingest_sample()
+
+    referenced = {child.metadata["parent_id"] for child in result.children}
+    assert referenced == set(result.parents)
+
+
+def test_parent_ids_are_stable_and_scoped_to_the_file():
+    first = _ingest_sample("a.pdf")
+    again = _ingest_sample("a.pdf")
+    other = _ingest_sample("b.pdf")
+
+    assert set(first.parents) == set(again.parents)
+    assert set(first.parents).isdisjoint(other.parents)
+
+
+def _doc(text: str, source: str) -> Document:
+    return Document(page_content=text, metadata={"source": source})
+
+
+def test_without_source_drops_old_chunks_and_keeps_the_rest():
+    docs = [_doc("a-1", "a.pdf"), _doc("b-1", "b.pdf"), _doc("a-2", "a.pdf")]
+
+    kept = without_source(docs, "a.pdf")
+
+    assert [doc.page_content for doc in kept] == ["b-1"]
+    assert [doc.page_content for doc in docs] == ["a-1", "b-1", "a-2"]
+
+
+def test_without_source_is_a_no_op_for_an_unknown_file():
+    docs = [_doc("a-1", "a.pdf")]
+    assert without_source(docs, "missing.pdf") == docs

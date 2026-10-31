@@ -21,6 +21,7 @@ from .bootstrap import configure_huggingface  # noqa: E402
 from .config import Settings  # noqa: E402
 from .history import HistoryStore  # noqa: E402
 from .indexer import ingest, safe_filename  # noqa: E402
+from .parents import ParentStore  # noqa: E402
 from .schemas import ChatRequest, ChatResponse, HistoryItem  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -30,6 +31,14 @@ def _load_cross_encoder(model_name: str):
     from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 
     return HuggingFaceCrossEncoder(model_name=model_name)
+
+
+def _stale_ids(vectorstore, source: str) -> list[str]:
+    return vectorstore.get(where={"source": source}).get("ids", [])
+
+
+def _delete_ids(vectorstore, ids: list[str]) -> None:
+    vectorstore.delete(ids=ids)
 
 
 def _require_level(settings: Settings, level: str) -> str:
@@ -77,8 +86,26 @@ async def lifespan(application: FastAPI):
         for text, meta in zip(stored.get("documents", []), stored.get("metadatas", []), strict=True)
     ]
     if not docs:
-        docs = [Document(page_content="欢迎使用 RAG 智能问答系统。", metadata={"level": "public"})]
+        docs = [
+            Document(
+                page_content="欢迎使用 RAG 智能问答系统。",
+                metadata={"level": "public", "parent_id": "seed::welcome", "source": "seed"},
+            )
+        ]
         vectorstore.add_documents(docs)
+
+    stale = sum(1 for doc in docs if "parent_id" not in doc.metadata)
+    if stale:
+        log.warning(
+            "%d/%d chunks have no parent_id (index predates parent-child chunking); "
+            "they answer from child text only. Rebuild with scripts/build_index.py --reset.",
+            stale,
+            len(docs),
+        )
+
+    parents = ParentStore(settings.parent_store)
+    loaded = parents.load()
+    log.info("loaded %d parent chunks from %s", loaded, settings.parent_store)
 
     pool = RetrieverPool(vectorstore, cross_encoder, settings)
     pool.rebuild(docs)
@@ -93,8 +120,9 @@ async def lifespan(application: FastAPI):
     application.state.redis = redis
     application.state.history = HistoryStore(redis, settings.history_window)
     application.state.vectorstore = vectorstore
+    application.state.parents = parents
     application.state.pool = pool
-    application.state.chain = build_chain(llm, pool, settings)
+    application.state.chain = build_chain(llm, pool, settings, parents)
 
     log.info("ready: %d chunks, levels=%s", len(pool.documents), list(settings.levels))
     yield
@@ -137,20 +165,27 @@ async def upload_pdf(
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        docs = await run_in_threadpool(ingest, dest, level, settings)
+        result = await run_in_threadpool(ingest, dest, level, settings)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"parse failed: {exc}") from exc
 
-    if not docs:
+    if not result.children:
         return {"message": "no text extracted", "filename": dest.name, "chunks_added": 0}
 
-    await run_in_threadpool(request.app.state.vectorstore.add_documents, docs)
-    await run_in_threadpool(request.app.state.pool.add, docs)
+    vectorstore = request.app.state.vectorstore
+    stale_ids = await run_in_threadpool(_stale_ids, vectorstore, dest.name)
+    # Add first, delete second: a failed write leaves the previous version searchable.
+    await run_in_threadpool(vectorstore.add_documents, result.children)
+    if stale_ids:
+        await run_in_threadpool(_delete_ids, vectorstore, stale_ids)
+    await run_in_threadpool(request.app.state.parents.update, dest.name, result.parents)
+    await run_in_threadpool(request.app.state.pool.replace_source, dest.name, result.children)
 
     return {
         "message": f"indexed at level {level}",
         "filename": dest.name,
-        "chunks_added": len(docs),
+        "chunks_added": len(result.children),
+        "replaced_chunks": len(stale_ids),
     }
 
 

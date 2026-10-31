@@ -1,8 +1,10 @@
-"""PDF -> text -> chunks -> LangChain Documents."""
+"""PDF -> text -> parent/child chunks -> LangChain Documents."""
 
 from __future__ import annotations
 
+import hashlib
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from langchain_core.documents import Document
@@ -44,6 +46,7 @@ def extract_pdf_text(path: Path) -> str:
 
 
 def chunk_to_documents(text: str, level: str, settings: Settings) -> list[Document]:
+    """Flat chunking. Used by the evaluation harness only; ingestion is two-level."""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
@@ -55,14 +58,72 @@ def chunk_to_documents(text: str, level: str, settings: Settings) -> list[Docume
     ]
 
 
-def ingest(path: Path, level: str, settings: Settings) -> list[Document]:
+@dataclass(frozen=True)
+class Ingested:
+    children: list[Document]
+    parents: dict[str, str]
+
+
+def parent_id(source: str, text: str) -> str:
+    """Stable id: the same text from the same file always maps to the same parent.
+
+    "::" is the separator because Windows file names cannot contain ":".
+    """
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+    return f"{source}::{digest}"
+
+
+def chunk_parent_child(text: str, level: str, source: str, settings: Settings) -> Ingested:
+    """Small children for retrieval, whole parents for the prompt.
+
+    The parent body is returned separately instead of being copied into every
+    child's metadata: one 800-char parent can own five children, and Chroma
+    would otherwise store that text five times and load it all at startup.
+    """
+    parent_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
+        separators=settings.chunk_separators,
+    )
+    child_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.child_chunk_size,
+        chunk_overlap=settings.child_chunk_overlap,
+        separators=settings.chunk_separators,
+    )
+
+    children: list[Document] = []
+    parents: dict[str, str] = {}
+    for index, parent_text in enumerate(parent_splitter.split_text(text)):
+        pid = parent_id(source, parent_text)
+        parents[pid] = parent_text
+        for child_text in child_splitter.split_text(parent_text):
+            children.append(
+                Document(
+                    page_content=child_text,
+                    metadata={
+                        "level": level,
+                        "parent_id": pid,
+                        "source": source,
+                        "parent_index": index,
+                    },
+                )
+            )
+    return Ingested(children=children, parents=parents)
+
+
+def ingest(path: Path, level: str, settings: Settings) -> Ingested:
     raw = extract_pdf_text(path)
     if not raw.strip():
-        return []
+        return Ingested(children=[], parents={})
     cleaned = strip_repeating_layout(
         raw,
         header_pattern=settings.header_pattern,
         footer_pattern=settings.footer_pattern,
         drop_cjk_line_breaks=settings.drop_cjk_line_breaks,
     )
-    return chunk_to_documents(cleaned, level, settings)
+    return chunk_parent_child(cleaned, level, path.name, settings)
+
+
+def without_source(docs: list[Document], source: str) -> list[Document]:
+    """Drop every chunk previously indexed from ``source``."""
+    return [doc for doc in docs if doc.metadata.get("source") != source]
