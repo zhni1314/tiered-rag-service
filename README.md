@@ -35,7 +35,8 @@ rewriting, Redis-backed session history and LLM cache, and SSE streaming.
 | 设计 | 做法 | 原因 |
 |---|---|---|
 | 混合检索 | `EnsembleRetriever`：BM25(jieba 分词) 0.5 + bge 向量 0.5，各取 top-20 | 纯向量召回会被专有名词、编号、缩写坑；纯 BM25 召回会被同义表述坑。中文还必须显式分词，`rank-bm25` 默认按空格切，对中文等于按整句切。 |
-| 重排 | `bge-reranker-v2-m3` cross-encoder，融合后压到 top-3 | bi-encoder 分别编码 query/doc，交互浅；cross-encoder 拼接编码，精度高但慢，所以只用于对 20 条候选做二次排序，不用于全库。 |
+| 重排 | `bge-reranker-v2-m3` cross-encoder，融合后压到 top-10 | bi-encoder 分别编码 query/doc，交互浅；cross-encoder 拼接编码，精度高但慢，所以只用于对 20 条候选做二次排序，不用于全库。 |
+| 父子分块 | 200 字子块负责检索，命中的 800 字父块进 Prompt；按名次去重取 3 块、3200 字预算 | 小粒度召回更准，大粒度答案更全；父块正文单独存（不写进子块 metadata），避免同一段文本按子块数量重复入库。 |
 | 查询重写 | **条件触发**：无历史，或问题里没有指代词，直接跳过 | 每次重写多花一次 LLM 调用。中文指代词表命中才走，省掉大部分首轮请求的延迟和费用。 |
 | 权限隔离 | 每个权限档位编译一套独立检索引擎 + Chroma metadata filter | 把「不要回答越权内容」写进 Prompt 是请求模型配合；在检索层过滤是让越权内容**根本不进上下文**。 |
 | 阻塞计算 | rerank 与向量检索放进 `asyncio.to_thread`；PDF 解析放进 `run_in_threadpool` | sentence-transformers 是同步 CPU 计算，直接在 `async def` 里跑会卡住整个 event loop，并发一上来 P99 就崩。 |
@@ -57,8 +58,9 @@ flowchart LR
         V[Chroma 向量 + level filter]
     end
     H --> E[EnsembleRetriever 0.5/0.5]
-    E --> X[CrossEncoder 重排 → top-3]
-    X --> P[Grounding Prompt]
+    E --> X[CrossEncoder 重排 → top-10 子块]
+    X --> C[按父块去重 → 3 块 / ≤3200 字]
+    C --> P[Grounding Prompt]
     P --> LLM[qwen-plus] --> A[answer]
 ```
 
@@ -105,6 +107,9 @@ python scripts/build_index.py --dir data/pdfs --level public
 python scripts/build_index.py --dir data/secret_docs --level secret
 ```
 
+没有自己的 PDF 时，可以直接用 [`examples/sample_corpus/`](examples/sample_corpus/) 里的
+自编演示语料（内容为虚构，见该目录说明）。
+
 ### Docker
 
 ```bash
@@ -136,14 +141,17 @@ src/tiered_rag/
 ├── config.py       # frozen dataclass，所有可调项的唯一来源
 ├── bootstrap.py    # HF_HOME / HF_ENDPOINT，必须早于模型加载器导入
 ├── text_cleaning.py# 页眉页脚、中文软换行拼接（纯函数，无依赖）
-├── indexer.py      # PDF → 文本 → chunk → Document；上传文件名安全
+├── indexer.py      # PDF → 文本 → 子块 + 父块；上传文件名安全、按来源替换
+├── parents.py      # 父块正文存储（JSON、原子写、按 source 替换）
+├── context.py      # 父块去重组装（纯函数：名次保序、整块预算）
 ├── retrieval.py    # BM25 + 向量 + 重排，按权限档编译；带锁重建
-├── chain.py        # Runnable DAG：条件重写 → 检索 → 生成
+├── chain.py        # Runnable DAG：条件重写 → 检索 → 拼上下文 → 生成
 ├── history.py      # Redis 会话历史
 └── service.py      # FastAPI 装配与路由
 ui/gradio_app.py    # 演示前端，只依赖 HTTP
 scripts/build_index.py
 scripts/evaluate.py   # 缓存收益 + RAGAS 实测，跑在自编语料上，密钥运行时输入
+scripts/chunking_bench.py  # flat vs 父子切块的 Prompt 命中率对比，离线免费
 tests/              # 纯逻辑单测，不需要模型/Redis/密钥
 ```
 
@@ -154,12 +162,15 @@ tests/              # 纯逻辑单测，不需要模型/Redis/密钥
 
 ```bash
 pip install pytest ruff
-pytest              # 27 passed
+pytest              # 76 passed
 ruff check src tests scripts
 ```
 
 覆盖：权限档位的有序访问推导、未知档位拒绝、配置默认值、中文软换行拼接、
-chunk 尺寸与 metadata 打标、**上传路径穿越拒绝**。
+父子切块的 id 稳定与来源隔离、**上下文组装**（名次保序去重、父块缺失回退子块、
+预算整块丢弃且不返回空串）、父块存储的原子写与损坏报错、**切块评测集的 gold 唯一性
+与跨文档校验**、**上传路径穿越拒绝**，以及评测脚本的隔离设计
+（Redis 键前缀清理、付费 API 请求预算、密钥不落盘）。
 
 ## 已知限制
 
@@ -171,9 +182,13 @@ chunk 尺寸与 metadata 打标、**上传路径穿越拒绝**。
    以 Token 为准（deny-by-default）。
 2. **评测只有小样本流程验证，尚无生产级指标。** `scripts/evaluate.py` 已能实测缓存收益与 RAGAS
    四项指标，但跑在 24 段自编语料、3 道题上：上下文指标已饱和，忠实度的组间差异被评委抖动盖过，
-   BM25 与不重排两组消融还没跑。权重 0.5/0.5、`top-3`、`chunk_size=800` 仍是经验值，
-   `recall@k` / `MRR` 仍未测量。见 [docs/evaluation.md](docs/evaluation.md)。
+   BM25 与不重排两组消融还没跑。权重 0.5/0.5、`chunk_size=800/200`、`max_parents=3` 仍是经验值。
+   父子切块已在 10 篇公开语料 + 60 题上测过 Prompt 命中率（hybrid 0.783 → 0.900，跨文档 0.40 → 0.60）；
+   CPU 重排只多 2–3 题：候选 5 条 0.933 / 1.9 s、19 条 0.950 / 6.6 s，把输出 top_n 从 3 提到 10
+   不涨命中。评的是「答案是否进 Prompt」而非最终答案正确率。
+   见 [docs/evaluation.md](docs/evaluation.md)。
 3. **每次上传全量重建 BM25**，`O(N)` 且随库增长变慢；小库无所谓，千级 chunk 就需要持久化 BM25。
+   重传同名文件会按 `source` 删旧 chunk，但索引结构变更（如 v2 → v3）必须 `--reset` 重建。
 4. **扫描版 PDF 无输出。** `pypdf` 提不到文字就返回空，需要 OCR。
 5. **用了已弃用 API。** `langchain_community.vectorstores.Chroma` 官方建议迁移 `langchain-chroma`。
 6. **LLM 缓存不感知权限档。** 缓存键由 Prompt 决定；跨档命中依赖上下文文本完全一致，
