@@ -11,7 +11,7 @@ fused, reranked by a cross-encoder, and compiled into **one retrieval engine per
 so a low-privilege caller physically cannot retrieve high-tier chunks. Includes conditional query
 rewriting, Redis-backed session history and LLM cache, and SSE streaming.
 
-**这不是「LangChain 官方 RAG 教程跑通了」。** 它解决的问题是：检索链路怎么组合才有效、权限怎么落到
+**这个项目解决的问题是**：检索链路怎么组合才有效、权限怎么落到
 检索层而不是 Prompt 里、以及这套东西怎么变成一个能被别人复现的服务。
 
 ---
@@ -185,7 +185,8 @@ ruff check src tests scripts
    以 Token 为准（deny-by-default）。
 2. **评测只有小样本流程验证，尚无生产级指标。** `scripts/evaluate.py` 已能实测缓存收益与 RAGAS
    四项指标，但跑在 24 段自编语料、3 道题上：上下文指标已饱和，忠实度的组间差异被评委抖动盖过，
-   BM25 与不重排两组消融还没跑。权重 0.5/0.5、`chunk_size=800/200`、`max_parents=3` 仍是经验值。
+   BM25 与向量检索的**单路**消融还没跑（不重排基线已经测出：hybrid 0.900 / 14 ms）。
+   权重 0.5/0.5、`chunk_size=800/200`、`max_parents=3` 仍是经验值。
    父子切块已在 10 篇公开语料 + 60 题上测过 Prompt 命中率（hybrid 0.783 → 0.900，跨文档 0.40 → 0.60）；
    CPU 重排只多 2–3 题：候选 5 条 0.933 / 1.9 s、19 条 0.950 / 6.6 s，把输出 top_n 从 3 提到 10
    不涨命中。评的是「答案是否进 Prompt」而非最终答案正确率。
@@ -206,17 +207,23 @@ ruff check src tests scripts
 按「对面试说服力」排序，不是按工作量：
 
 - [ ] 真实鉴权：角色化 Token + deny-by-default（补限制 1）
-- [ ] 评测集扩到 30+ 题（含干扰文档），补 BM25 与不重排两组消融，测 `recall@k` / `MRR`（补限制 2）
+- [x] 评测集扩到 30+ 题：已到 **10 篇公开语料 / 60 题**（30 精确、15 同义、15 跨文档），
+  离线跑 Prompt 命中率，0 次付费调用（`scripts/chunking_bench.py`）
+- [ ] 补 `recall@k` / `MRR` 与 BM25、向量**单路**消融（现在永远走融合，权重设 0 不等于关掉另一路）（补限制 2）
 - [ ] 引用溯源：答案回链到 chunk 与页码
 - [ ] 迁移 `langchain-chroma`，去掉弃用告警
 - [ ] BM25 索引持久化，避免全量重建
 - [ ] 大文件入库改后台任务队列
 - [ ] 结构化日志 + `/metrics`（Prometheus）
 - [ ] 把检索器包成 tool，交给 agent 决定何时检索（从 RAG 迈向 Agent）
+- [x] ~~PDF 混合表格解析（pypdf + pdfplumber）~~：**实测否掉，不做**。合成语料 13 张表全绿，
+  真实文档上默认策略对 6 张带标题的学术表召回 **0**、对另一篇误检 **10** 张，正文抽取粘连，
+  解析耗时 ×3.0–9.2。取舍与数据见 [ADR-0013](docs/adr/0013-放弃-pdf-混合表格解析.md)
 
 ## 技术栈
 
-`Python 3.11+` · `LangChain 1.4` · `FastAPI 0.162` · `Chroma 1.5` · `sentence-transformers 6.2` ·
+`Python 3.12`（CI 与镜像同版本，本地 3.14 亦跑通） · `LangChain 1.4` · `FastAPI 0.162` · `Chroma 1.5` ·
+`sentence-transformers 6.2` ·
 `bge-small-zh-v1.5` + `bge-reranker-v2-m3` · `Redis` · `Gradio 6.30` · `Docker Compose`
 
 LangChain 1.x 的检索组件已迁到 `langchain-classic`，本项目按新命名空间接入。
