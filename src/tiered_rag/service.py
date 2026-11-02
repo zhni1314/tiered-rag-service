@@ -170,7 +170,13 @@ async def upload_pdf(
         raise HTTPException(status_code=500, detail=f"parse failed: {exc}") from exc
 
     if not result.children:
-        return {"message": "no text extracted", "filename": dest.name, "chunks_added": 0}
+        return {
+            "message": "no text extracted",
+            "filename": dest.name,
+            "chunks_added": 0,
+            "pages_failed": result.pages_failed,
+            "failed_pages": list(result.failed_pages),
+        }
 
     vectorstore = request.app.state.vectorstore
     stale_ids = await run_in_threadpool(_stale_ids, vectorstore, dest.name)
@@ -186,6 +192,10 @@ async def upload_pdf(
         "filename": dest.name,
         "chunks_added": len(result.children),
         "replaced_chunks": len(stale_ids),
+        # Pages the parser could not read are dropped from the index; the caller needs to
+        # see that, otherwise a partially unreadable document looks like a clean ingest.
+        "pages_failed": result.pages_failed,
+        "failed_pages": list(result.failed_pages),
     }
 
 

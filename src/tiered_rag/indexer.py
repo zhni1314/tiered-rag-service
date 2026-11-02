@@ -39,10 +39,29 @@ def safe_filename(original: str, upload_dir: Path) -> Path:
     return dest
 
 
-def extract_pdf_text(path: Path) -> str:
+@dataclass(frozen=True)
+class Extracted:
+    text: str
+    pages_failed: int = 0
+    failed_pages: tuple[int, ...] = ()
+
+
+def extract_pdf_pages(path: Path) -> Extracted:
+    """Extract text page by page, skipping pages the parser chokes on.
+
+    Real-world PDFs do break pypdf: a 26-page arXiv survey raises ``AssertionError``
+    inside ``PageObject.extract_text()`` on page 1. One damaged page must not cost the
+    whole document, and it must not pass silently either -- hence the counters.
+    """
     reader = PdfReader(str(path))
-    pages = [page.extract_text() for page in reader.pages]
-    return "\n".join(text for text in pages if text)
+    texts: list[str] = []
+    failed: list[int] = []
+    for number, page in enumerate(reader.pages, start=1):
+        try:
+            texts.append(page.extract_text() or "")
+        except Exception:  # noqa: BLE001 - pypdf raises assorted internal errors
+            failed.append(number)
+    return Extracted("\n".join(text for text in texts if text), len(failed), tuple(failed))
 
 
 def chunk_to_documents(text: str, level: str, settings: Settings) -> list[Document]:
@@ -62,6 +81,8 @@ def chunk_to_documents(text: str, level: str, settings: Settings) -> list[Docume
 class Ingested:
     children: list[Document]
     parents: dict[str, str]
+    pages_failed: int = 0
+    failed_pages: tuple[int, ...] = ()
 
 
 def parent_id(source: str, text: str) -> str:
@@ -112,16 +133,19 @@ def chunk_parent_child(text: str, level: str, source: str, settings: Settings) -
 
 
 def ingest(path: Path, level: str, settings: Settings) -> Ingested:
-    raw = extract_pdf_text(path)
-    if not raw.strip():
-        return Ingested(children=[], parents={})
+    extracted = extract_pdf_pages(path)
+    if not extracted.text.strip():
+        return Ingested(children=[], parents={}, pages_failed=extracted.pages_failed,
+                        failed_pages=extracted.failed_pages)
     cleaned = strip_repeating_layout(
-        raw,
+        extracted.text,
         header_pattern=settings.header_pattern,
         footer_pattern=settings.footer_pattern,
         drop_cjk_line_breaks=settings.drop_cjk_line_breaks,
     )
-    return chunk_parent_child(cleaned, level, path.name, settings)
+    result = chunk_parent_child(cleaned, level, path.name, settings)
+    return Ingested(children=result.children, parents=result.parents,
+                    pages_failed=extracted.pages_failed, failed_pages=extracted.failed_pages)
 
 
 def without_source(docs: list[Document], source: str) -> list[Document]:

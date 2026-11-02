@@ -43,7 +43,7 @@ rewriting, Redis-backed session history and LLM cache, and SSE streaming.
 | 缓存 | Redis 同时做会话历史和 LangChain LLM cache | 重复问题不再打模型。 |
 | 配置 | 全部环境变量化，`Settings` 为 frozen dataclass | 换机器、进容器不用改代码。测试可以直接注入 env dict，不需要 mock。 |
 
-完整取舍记录见 [docs/decisions.md](docs/decisions.md)。
+完整取舍记录见 [docs/decisions.md](docs/decisions.md)；2026-11-02 起的单条决策改放 `docs/adr/`。
 
 ## 检索链路
 
@@ -162,7 +162,7 @@ tests/              # 纯逻辑单测，不需要模型/Redis/密钥
 
 ```bash
 pip install pytest ruff
-pytest              # 76 passed
+pytest              # 79 passed
 ruff check src tests scripts
 ```
 
@@ -171,7 +171,8 @@ ruff check src tests scripts
 **并发重传两个文件时 BM25 不丢任一文件**（串行化重建锁）、
 **上下文组装**（名次保序去重、父块缺失回退子块、
 预算整块丢弃且不返回空串）、父块存储的原子写与损坏报错、**切块评测集的 gold 唯一性
-与跨文档校验**、**上传路径穿越拒绝**，以及评测脚本的隔离设计
+与跨文档校验**、**上传路径穿越拒绝**、**一页让 `pypdf` 抛异常时其余页照常入库并回报 `pages_failed`**，
+以及评测脚本的隔离设计
 （Redis 键前缀清理、付费 API 请求预算、密钥不落盘）。
 
 ## 已知限制
@@ -192,6 +193,9 @@ ruff check src tests scripts
 3. **每次上传全量重建 BM25**，`O(N)` 且随库增长变慢；小库无所谓，千级 chunk 就需要持久化 BM25。
    重传同名文件会按 `source` 删旧 chunk，但索引结构变更（如 v2 → v3）必须 `--reset` 重建。
 4. **扫描版 PDF 无输出。** `pypdf` 提不到文字就返回空，需要 OCR。
+   同样地，`pypdf` 解析失败的页会被跳过（真实文档里遇到过：一份 26 页论文第 1 页抛 `AssertionError`）：
+   文档整体能入库，但**那几页的内容不在索引里**，只体现在 `/upload` 返回的 `pages_failed` / `failed_pages`。
+   调用方不看这两个字段，就会把「部分可读」当成「完全成功」。
 5. **用了已弃用 API。** `langchain_community.vectorstores.Chroma` 官方建议迁移 `langchain-chroma`。
 6. **LLM 缓存不感知权限档。** 缓存键由 Prompt 决定；跨档命中依赖上下文文本完全一致，
    严格说不是隔离泄漏，但值得显式加 level 维度。

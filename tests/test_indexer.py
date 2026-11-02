@@ -133,3 +133,57 @@ def test_markdown_tables_still_split_into_small_children():
 
     assert result.children
     assert all(len(child.page_content) <= 200 for child in result.children)
+
+
+class _OkPage:
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def extract_text(self) -> str:
+        return self._text
+
+
+class _PoisonedPage:
+    """Stand-in for the pages in a real arXiv PDF that make pypdf raise AssertionError."""
+
+    def extract_text(self) -> str:
+        raise AssertionError("mypy")
+
+
+def test_one_poisoned_page_does_not_kill_the_document(monkeypatch):
+    import tiered_rag.indexer as indexer
+
+    pages = [_OkPage("第一页正文"), _PoisonedPage(), _OkPage("第三页正文")]
+    monkeypatch.setattr(indexer, "PdfReader", lambda _path: type("R", (), {"pages": pages})())
+
+    out = indexer.extract_pdf_pages(Path("anything.pdf"))
+
+    assert out.pages_failed == 1
+    assert out.failed_pages == (2,)          # 1-based, so it is readable in an API response
+    assert "第一页正文" in out.text and "第三页正文" in out.text
+
+
+def test_ingest_passes_the_failure_counts_up(monkeypatch):
+    import tiered_rag.indexer as indexer
+
+    long_enough = "内容" * 300
+    pages = [_OkPage(long_enough), _PoisonedPage()]
+    monkeypatch.setattr(indexer, "PdfReader", lambda _path: type("R", (), {"pages": pages})())
+
+    result = indexer.ingest(Path("anything.pdf"), "public", _settings())
+
+    assert result.children
+    assert result.pages_failed == 1
+    assert result.failed_pages == (2,)
+
+
+def test_a_fully_unreadable_document_still_reports_why(monkeypatch):
+    import tiered_rag.indexer as indexer
+
+    pages = [_PoisonedPage(), _PoisonedPage()]
+    monkeypatch.setattr(indexer, "PdfReader", lambda _path: type("R", (), {"pages": pages})())
+
+    result = indexer.ingest(Path("anything.pdf"), "public", _settings())
+
+    assert result.children == []
+    assert (result.pages_failed, result.failed_pages) == (2, (1, 2))

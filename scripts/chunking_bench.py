@@ -38,7 +38,7 @@ from tiered_rag.context import assemble_context  # noqa: E402
 from tiered_rag.indexer import (  # noqa: E402
     chunk_parent_child,
     chunk_to_documents,
-    extract_pdf_text,
+    extract_pdf_pages,
 )
 from tiered_rag.text_cleaning import strip_repeating_layout  # noqa: E402
 
@@ -69,7 +69,7 @@ def load_corpus(settings: Settings, folder: Path) -> list[tuple[str, str]]:
     docs = []
     for pdf in sorted(folder.glob("*.pdf")):
         cleaned = strip_repeating_layout(
-            extract_pdf_text(pdf),
+            extract_pdf_pages(pdf).text,
             header_pattern=settings.header_pattern,
             footer_pattern=settings.footer_pattern,
             drop_cjk_line_breaks=settings.drop_cjk_line_breaks,
