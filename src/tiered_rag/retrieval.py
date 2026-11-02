@@ -60,6 +60,11 @@ class RetrieverPool:
         self._engines: dict[str, ContextualCompressionRetriever] = {}
         self._docs: list[Document] = []
         self._lock = threading.Lock()
+        # Serialises ingest's read-modify-write, so two concurrent uploads cannot each
+        # rebuild from a snapshot taken before the other's write landed (which silently
+        # dropped a file's chunks from BM25 until the next restart). Kept separate from
+        # _lock so a running /chat is never blocked by an upload in progress.
+        self._build_lock = threading.Lock()
 
     @property
     def documents(self) -> list[Document]:
@@ -83,15 +88,17 @@ class RetrieverPool:
             self._engines = engines
 
     def add(self, docs: list[Document]) -> None:
-        with self._lock:
-            combined = self._docs + docs
-        self.rebuild(combined)
+        with self._build_lock:
+            with self._lock:
+                combined = self._docs + docs
+            self.rebuild(combined)
 
     def replace_source(self, source: str, docs: list[Document]) -> None:
         """Swap in a re-uploaded file without leaving its old chunks in BM25."""
-        with self._lock:
-            kept = without_source(self._docs, source)
-        self.rebuild(kept + docs)
+        with self._build_lock:
+            with self._lock:
+                combined = without_source(self._docs, source) + docs
+            self.rebuild(combined)
 
     def get(self, level: str):
         with self._lock:

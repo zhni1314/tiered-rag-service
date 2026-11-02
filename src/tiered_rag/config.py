@@ -34,6 +34,21 @@ def _path(env: dict[str, str], key: str, default: str) -> Path:
     return p if p.is_absolute() else PROJECT_ROOT / p
 
 
+DEFAULT_CHUNK_SEPARATORS = ["\n\n", "。", "！", "？", "\n"]
+
+
+def _separators(env: dict[str, str]) -> list[str]:
+    """Comma-separated list; a literal backslash-n in the value means a newline.
+
+    The last entry "\\n" is what keeps Markdown tables (one row per line, no
+    sentence punctuation) from producing oversized child chunks.
+    """
+    raw = _get(env, "TIERED_RAG_CHUNK_SEPARATORS")
+    if not raw:
+        return list(DEFAULT_CHUNK_SEPARATORS)
+    return [item.replace("\\n", "\n") for item in raw.split(",") if item]
+
+
 def _levels(env: dict[str, str]) -> tuple[str, ...]:
     raw = _get(env, "TIERED_RAG_LEVELS", "public,secret")
     parsed = tuple(item.strip() for item in raw.split(",") if item.strip())
@@ -127,9 +142,7 @@ class Settings:
                 "TIERED_RAG_PARENT_STORE",
                 str(chroma_dir / "parent_store.json"),
             ),
-            chunk_separators=[
-                s for s in _get(env, "TIERED_RAG_CHUNK_SEPARATORS", "\n\n,。,！,？").split(",")
-            ],
+            chunk_separators=_separators(env),
             header_pattern=_get(env, "TIERED_RAG_HEADER_PATTERN"),
             footer_pattern=_get(env, "TIERED_RAG_FOOTER_PATTERN"),
             drop_cjk_line_breaks=_get(env, "TIERED_RAG_DROP_CJK_BREAKS", "true").lower()

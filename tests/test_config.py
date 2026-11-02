@@ -29,6 +29,15 @@ def test_parent_store_can_be_pointed_elsewhere():
     assert s.parent_store.parts[-2:] == ("custom", "parents.json")
 
 
+def test_default_separators_end_with_newline_for_tables():
+    assert _settings().chunk_separators == ["\n\n", "。", "！", "？", "\n"]
+
+
+def test_env_separators_understand_escaped_newline():
+    s = _settings(TIERED_RAG_CHUNK_SEPARATORS="\\n\\n,。,\\n")
+    assert s.chunk_separators == ["\n\n", "。", "\n"]
+
+
 def test_vector_weight_defaults_to_the_remainder_of_bm25():
     assert _settings(TIERED_RAG_BM25_WEIGHT="0.3").vector_weight == 0.7
 

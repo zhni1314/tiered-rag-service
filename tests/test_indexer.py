@@ -123,3 +123,13 @@ def test_without_source_drops_old_chunks_and_keeps_the_rest():
 def test_without_source_is_a_no_op_for_an_unknown_file():
     docs = [_doc("a-1", "a.pdf")]
     assert without_source(docs, "missing.pdf") == docs
+
+
+def test_markdown_tables_still_split_into_small_children():
+    """A table has no sentence punctuation; only "\\n" can keep children small."""
+    table = "| 项目 | 阈值 |\n" + ("| 很长的表格行内容用于压测切分边界abcdefghij | 99 |\n" * 40)
+
+    result = chunk_parent_child(table, "public", "tables.pdf", _settings())
+
+    assert result.children
+    assert all(len(child.page_content) <= 200 for child in result.children)
